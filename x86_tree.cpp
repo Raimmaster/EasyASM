@@ -1,4 +1,5 @@
 #include <iostream>
+#include "native_lib.h"
 #include "x86_tree.h"
 #include "util.h"
 
@@ -39,8 +40,11 @@ void XNode::operator delete(void *ptrb)
         }                                                               \
         uint32_t value2;                                                \
                                                                         \
+        if (ref2.bitSize == 0)                                          \
+            ref2.bitSize = ref1.bitSize;                                \
+                                                                        \
         if (!ref2.deref(value2)) {                                 \
-            reportError("Unexpected error %d: %s.\n", __LINE__, __FUNCTION__);  \
+            reportError("Unexpected error (deref) maybe a BUG  '%s'\n", getName());  \
             return false;   \
         }                   \
                             \
@@ -160,6 +164,31 @@ bool XArgMemRef::getReference(X86Sim *xsim, XReference &ref)
     return true;
 }
 
+bool XArgPhyAddress::getReference(X86Sim *sim, XReference &ref)
+{
+    uint32_t vaddr;
+
+    if (!expr->eval(sim, vaddr))
+        return false;
+
+    ref.type = RT_PMem;
+    ref.bitSize = BS_32;
+    ref.address = vaddr;
+    ref.sim = sim;
+
+    return true;
+}
+
+bool XArgPhyAddress::eval(X86Sim *sim, int resultSize, uint8_t flags, uint32_t &result)
+{
+    XReference my_ref;
+    
+    if (!getReference(sim, my_ref))
+        return false;
+    
+    return my_ref.deref(result);
+}
+
 bool XArgConstant::eval(X86Sim *sim, int resultSize, uint8_t flags, uint32_t &result)
 {
     UNUSED(sim);
@@ -217,7 +246,7 @@ bool XAddrExpr2Term::eval(X86Sim *xsim, uint32_t &result)
     uint32_t v1, v2;
 
     if ((op == XOP_MINUS) && !expr2->isA(XADDR_EXPR_CONST)) {
-        reportError("Invalid expression '%s' in memory reference.", toString().c_str());
+        reportError("Invalid expression '%s' in memory reference.\n", toString().c_str());
         return false;
     }
 
@@ -244,7 +273,7 @@ bool XAddrExpr2Term::eval(X86Sim *xsim, uint32_t &result)
         return true;
 
     } else {
-        reportError("Invalid expression '%s' in memory reference.", toString().c_str());
+        reportError("Invalid expression '%s' in memory reference.\n", toString().c_str());
         return false;
     }
 }
@@ -252,11 +281,11 @@ bool XAddrExpr2Term::eval(X86Sim *xsim, uint32_t &result)
 bool XAddrExpr3Term::eval(X86Sim *xsim, uint32_t &result)
 {
     if ((op1 == XOP_MINUS) && !expr2->isA(XADDR_EXPR_CONST)) {
-        reportError("Invalid expression '%s' in memory reference.", toString().c_str());
+        reportError("Invalid expression '%s' in memory reference.\n", toString().c_str());
         return false;
     }
     if ((op2 == XOP_MINUS) && !expr3->isA(XADDR_EXPR_CONST)) {
-        reportError("Invalid expression '%s' in memory reference.", toString().c_str());
+        reportError("Invalid expression '%s' in memory reference.\n", toString().c_str());
         return false;
     }
 
@@ -292,7 +321,7 @@ bool XAddrExpr3Term::eval(X86Sim *xsim, uint32_t &result)
         return true;
 
     } else {
-        reportError("Invalid expression '%s' in memory reference.", toString().c_str());
+        reportError("Invalid expression '%s' in memory reference.\n", toString().c_str());
         return false;
     }
 }
@@ -315,7 +344,7 @@ bool XAddrExprMult::eval(X86Sim *xsim, uint32_t &result)
     } else if ( expr1->isA(XADDR_EXPR_CONST) &&
                 expr2->isA(XADDR_EXPR_REG) ) {
     } else {
-        reportError("Invalid expression '%s' in memory reference.", toString().c_str());
+        reportError("Invalid expression '%s' in memory reference.\n", toString().c_str());
         return false;
     }
 
@@ -624,6 +653,9 @@ IMPLEMENT_INSTRUCTION(Imul2) {
     if (!arg2->getReference(sim, ref2))
         return false;
     
+    if (ref2.bitSize == 0)
+        ref2.bitSize = ref1.bitSize;
+
     switch (ref2.type) {
         case RT_Mem:
         case RT_Reg: {
@@ -1218,9 +1250,59 @@ IMPLEMENT_INSTRUCTION(Jae) {
 }
 
 IMPLEMENT_INSTRUCTION(Call) {
-    UNUSED(result);
-
     uint32_t target_addr;
+    
+    result.type = RT_None;
+    
+    if (arg->isA(XARG_EXT_FUNC)) {
+        XArgExternalFuntionName *fn_arg = (XArgExternalFuntionName *)arg;
+		string libFullName = getLibFullName(fn_arg->libName);
+        HLIB lhandle = openLibrary(libFullName.c_str());
+        
+        if (lhandle == NULL) {
+            reportError("Cannot open library '%s'.\n", libFullName.c_str());
+            return false;
+        }
+                
+        HFUNC hfunc = getFunctionAddr(lhandle, fn_arg->funcName.c_str());
+        
+        if (hfunc == NULL) {
+            reportError("Function '%s' doesn't exist in library '%s'.\n", fn_arg->funcName.c_str(), libFullName.c_str());
+            return false;
+        }
+        
+        uint32_t esp, reg_eax;
+        void *old_stack_ptr, *new_stack_ptr;
+        
+        sim->getRegValue(R_ESP, esp);
+        
+        new_stack_ptr = (void *)sim->getMemPtr(esp);
+
+#ifdef _WIN32
+		__asm {
+			mov old_stack_ptr, esp
+			mov esp, new_stack_ptr
+			call [hfunc]
+			mov reg_eax, eax
+			mov esp, old_stack_ptr
+		};
+#elif __linux__
+        asm volatile ("xchg %%esp, %0\n\t"
+        : "=r"(old_stack_ptr) /* output */
+        : "0"(new_stack_ptr) /* input */
+        );
+        
+        asm volatile ("call *%1\n" : "=a"(reg_eax) : "r"(hfunc));
+        asm volatile ("mov %0, %%esp\n\t" : : "r"(old_stack_ptr) );
+#else
+#error "Unknownk compiler"
+#endif
+        closeLibrary(lhandle);
+        
+        sim->setRegValue(R_EAX, reg_eax);
+        
+        return true;
+    }
     
     if (!arg->eval(sim, BS_32, 0, target_addr)) {
         reportError("Invalid argument for call instruction. Expected address, found '%s'.\n",
@@ -1629,39 +1711,74 @@ bool XCmdSet::exec(X86Sim *sim, XReference &result)
 
 bool XCmdShow::exec(X86Sim *sim, XReference &result)
 {
+    XReference a_ref;
+    uint32_t value;
+    
     result.type = RT_None;
 
-    switch (arg->getKind()) {
-        case XARG_REGISTER: {
-            XArgRegister *reg = (XArgRegister *)arg;
-
-            sim->showRegValue(reg->regId, dataFormat);
-
-            return true;
-        }
-        case XARG_MEMREF: {
-            XArgMemRef *mref = (XArgMemRef *)arg;
-            XBitSize bitSize = mref->sizeDirective;
-            uint32_t vaddr;
-
-            if (bitSize == 0) {
-                reportError("No size directive specified.\n");
+    if (!arg->getReference(sim, a_ref)) {
+        reportError("(1) Unexpected error in show '%s' command maybe a BUG.\n", arg->toString().c_str());
+        return false;
+    }  
+    
+    if ((dataFormat == F_Ascii) && (a_ref.bitSize != BS_8)) {
+        reportError("'Ascii' format can only be used with byte arguments. Argument size is %d.\n", a_ref.bitSize);
+        return false;
+    }
+    
+    switch (a_ref.type) {
+        case RT_Reg: {
+            
+            if (!a_ref.deref(value)) {
+                reportError("(2) Unexpected error in show '%s' command maybe a BUG.\n", arg->toString().c_str());
                 return false;
             }
-            if (!mref->expr->eval(sim, vaddr))
-                return false;
-
-            int i;
             
-            for (i = 0; i < mref->count; i++) {
-                if (!sim->showMemValue(vaddr, bitSize, dataFormat)) {
-                    reportError("Invalid address '0x%X'.\n", vaddr);
+            if ((a_ref.address == R_EFLAGS) && dataFormat == F_Unspecified) {
+                uint32_t eflags;
+                
+                sim->getRegValue(R_EFLAGS, eflags);
+                
+                cout << "EFLAGS: "
+                     << "(CF=" << ((value & CF_MASK) != 0) << ", "
+                     << "PF=" << ((value & PF_MASK) != 0) << ", "
+                     << "AF=" << ((value & AF_MASK) != 0) << ", "
+                     << "ZF=" << ((value & ZF_MASK) != 0) << ", "
+                     << "SF=" << ((value & SF_MASK) != 0) << ", "
+                     << "OF=" << ((value & OF_MASK) != 0) << ")"
+                     << endl;
+            } else {
+                cout << arg->toString() << " = ";
+                printNumber(value, a_ref.bitSize, dataFormat);
+                cout << endl;
+            }
+            return true;
+        }
+        case RT_Mem: {
+            int i, count = ((XArgMemRef *)arg)->count;
+
+            if (a_ref.bitSize == 0) {
+                reportError("Memory reference argument '%s' requires size specification (byte, word or dword).\n",
+                           arg->toString().c_str());
+
+                return false;
+            }
+            
+            for (i = 0; i < count; i++) {
+                
+                if (!a_ref.deref(value)) {
+                    reportError("Invalid address '0x%X'.\n", a_ref.address);
                     return false;
                 }
-                switch (bitSize) {
-                    case BS_8: vaddr ++; break;
-                    case BS_16: vaddr += 2; break;
-                    case BS_32: vaddr += 4; break;
+                                
+                cout << X86Sim::sizeDirectiveToString(a_ref.bitSize) << " [0x" << hex << a_ref.address << dec << "] = ";
+                printNumber(value, a_ref.bitSize, dataFormat);
+                cout << endl;
+                
+                switch (a_ref.bitSize) {
+                    case BS_8: a_ref.address ++; break;
+                    case BS_16: a_ref.address += 2; break;
+                    case BS_32: a_ref.address += 4; break;
                     default:
                         reportError("BUG in the machine\n");
                         return false;
@@ -1670,13 +1787,9 @@ bool XCmdShow::exec(X86Sim *sim, XReference &result)
 
             return true;
         }
-        case XARG_CONST: {
-            uint32_t value;
-
-            arg->eval(sim, BS_32, 0, value);
-
+        case RT_Const: {
             printNumber(value, BS_32, dataFormat);
-            printf("\n");
+            cout << endl;
 
             return true;
         }
@@ -1707,6 +1820,12 @@ bool XCmdExec::exec(X86Sim *sim, XReference &result)
     in.close();
     
     return success;
+}
+
+bool XCmdDebug::exec(X86Sim *sim, XReference &result)
+{
+    reportError("Debug command is only available in interactive mode.\n");
+    return false;
 }
 
 bool XCmdStop::exec(X86Sim *sim, XReference &result)

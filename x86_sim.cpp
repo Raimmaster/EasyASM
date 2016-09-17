@@ -2,6 +2,7 @@
 #include <sstream>
 #include <map>
 #include "x86_sim.h"
+#include "x86_dbg.h"
 #include "x86_lexer.h"
 #include "x86_tree.h"
 #include "mempool.h"
@@ -27,6 +28,11 @@ bool XReference::deref(uint32_t &value)
     switch (type) {
             case RT_Reg: return sim->getRegValue(address, value);
             case RT_Mem: return sim->readMem(address, value, bitSize);
+            case RT_PMem: {
+                value = (uint32_t)sim->getMemPtr(address);
+             
+                return value != 0;
+            }
             case RT_Const: value = address; break;
             default:
                 return false;
@@ -54,6 +60,7 @@ X86Sim::X86Sim()
     stack_start_address = X_VIRTUAL_STACK_END_ADDR - (X_STACK_SIZE_WORDS * 4);
     runtime_context = NULL;
     label_map = NULL;
+    dbg = NULL;
 }
 
 bool X86Sim::getRegValue(int regId, uint32_t &value)
@@ -128,41 +135,6 @@ bool X86Sim::setRegValue(int regId, uint32_t value)
     return true;
 }
 
-bool X86Sim::showRegValue(int regId, PrintFormat format)
-{
-    uint32_t value;
-
-    if (!getRegValue(regId, value))
-        return false;
-
-    XBitSize bs;
-
-    if ((regId >= R_EAX) && (regId <= R_EFLAGS)) {
-        bs = BS_32;
-    }
-    else if ((regId >= R_AX) && (regId <= R_DX)) {
-        bs = BS_16;
-    }
-    else if ((regId >= R_AL) && (regId <= R_DH)) {
-        bs = BS_8;
-    } else {
-        return false;
-    }
-
-    if ((regId == R_EFLAGS) && format == F_Unspecified) {
-        cout << xreg[regId] << ": ";
-        showFlags();
-    }
-    else {
-        cout << xreg[regId] << " = ";
-        printNumber(value, bs, format);
-    }
-
-    cout << endl;
-
-    return true;
-}
-
 bool X86Sim::readMem(uint32_t vaddr, uint32_t &result, XBitSize bitSize)
 {
     uint8_t *pmem = getMemPtr(vaddr);
@@ -218,20 +190,6 @@ bool X86Sim::writeMem(uint32_t vaddr, uint32_t value, XBitSize bitSize)
     return true;
 }
 
-bool X86Sim::showMemValue(uint32_t vaddr, XBitSize bitSize, PrintFormat format)
-{
-    uint32_t value;
-
-    if (!readMem(vaddr, value, bitSize))
-        return false;
-
-    printf("%s [0x%X] = ", sizeDirectiveToString(bitSize), vaddr);
-    printNumber(value, bitSize, format);
-    printf("\n");
-
-    return true;
-}
-
 bool translateVirtualToPhysical(uint32_t vaddr, uint32_t &paddr);
 
 bool X86Sim::parseFile(istream *in, XParserContext &ctx)
@@ -279,12 +237,8 @@ bool X86Sim::parseFile(istream *in, XParserContext &ctx)
     ParseFree(pParser, free);
 
     tk_pool->freeAll();
-    
-    if (ctx.error != 0) {
-        return false;
-    }
-    
-    return true;
+
+    return (ctx.error == 0);
 }
 
 bool X86Sim::resolveLabels(list<XInstruction *> &linst, vector<XInstruction *> &vinst, map<string, uint32_t> &lbl_map)
@@ -318,9 +272,13 @@ bool X86Sim::resolveLabels(list<XInstruction *> &linst, vector<XInstruction *> &
     
 bool X86Sim::exec(istream *in)
 {
+    if (dbg != NULL) {
+        reportError("The simulator is in debug mode.\n");
+        return false;
+    }
+    
     XRtContext rt_ctx, *old_rt_ctx;
     XParserContext parser_ctx;
-    
     
     old_rt_ctx = runtime_context;
     xpool = &(parser_ctx.parser_pool);
@@ -368,6 +326,76 @@ bool X86Sim::exec(istream *in)
     label_map = old_label_map;
     
     return result;
+}
+
+bool X86Sim::debug(string asm_file) 
+{
+    if (dbg != NULL) {
+        reportError("The simulator is in debug mode already.\n");
+        return false;
+    }
+    
+    ifstream in;
+    
+    in.open(asm_file.c_str(), ifstream::in|ifstream::binary);
+
+    if (!in.is_open()) {
+        reportError("Cannot open file '%s'\n", asm_file.c_str());
+        return false;
+    }
+    
+    vector<XInstruction *> instList;
+
+    label_map = new map<string, uint32_t>;
+    xpool = new MemPool();
+    
+    if (!loadFile(&in, instList, *label_map)) {
+        delete label_map;
+        delete xpool;
+        
+        return false;
+    }
+    
+    vector<string> sourceLines;
+
+    in.clear();
+    in.seekg(0);
+    
+    if (in.fail()) {
+        cout << "Oops. Fail." << endl;
+        dbg->stop();
+        return false;
+    }
+    
+    while (!in.eof()) {
+        string line;
+        getline(in, line);
+        sourceLines.push_back(line);
+    };
+    
+    runtime_context = new XRtContext;
+    
+    dbg = new X86Debugger(this, instList, xpool);
+    dbg->setSourceLines(sourceLines);
+        
+    in.close();
+    
+    return true;
+}
+
+bool X86Sim::loadFile(istream *in, vector<XInstruction *> &instList, map<string, uint32_t> &labelMap)
+{
+    XParserContext parser_ctx;
+    
+    if (!parseFile(in, parser_ctx)) {
+        return false;
+    }
+    
+    if (!resolveLabels(parser_ctx.input_list, instList, labelMap)) {
+        return false;
+    }
+    
+    return true;
 }
 
 void X86Sim::updateFlags(uint8_t op, uint8_t sign1, uint8_t sign2, uint32_t arg1, uint32_t arg2, uint32_t result, XBitSize bitSize)
@@ -482,18 +510,6 @@ bool X86Sim::doOperation(unsigned char op, XReference &ref1, uint32_t value2)
     }
 
     return true;
-}
-
-void X86Sim::showFlags()
-{
-    uint32_t value = this->gpr[R_EFLAGS];
-
-    cout << "(CF=" << ((value & CF_MASK) != 0) << ", "
-         << "PF=" << ((value & PF_MASK) != 0) << ", "
-         << "AF=" << ((value & AF_MASK) != 0) << ", "
-         << "ZF=" << ((value & ZF_MASK) != 0) << ", "
-         << "SF=" << ((value & SF_MASK) != 0) << ", "
-         << "OF=" << ((value & OF_MASK) != 0) << ")";
 }
 
 bool X86Sim::translateVirtualToPhysical(uint32_t vaddr, uint32_t &paddr)
