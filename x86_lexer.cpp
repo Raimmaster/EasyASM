@@ -8,9 +8,7 @@
 
 using namespace std;
 
-#define XTK_ERROR 9999
-
-void reportError(const char *format, ...);
+void reportRuntimeError(const char *format, ...);
 
 #define RETURN_TOKEN(tk)    \
     do {                    \
@@ -215,8 +213,13 @@ int X86Lexer::getNextToken()
             case '"': {
                 tkText.clear();
                 ch = nextChar();
-                APPEND_SEQUENCE(ch != '"', tkText);
+                APPEND_SEQUENCE((ch != '"') && (ch != EOF), tkText);
                 ch = nextChar();
+                
+                if (ch == EOF) {
+                    tokenInfo.set(string("unterminated string \"") + tkText + string("\""), currentLine);
+                    return XTK_ERROR;
+                }                
                 tokenInfo.set(tkText, currentLine);
                 
                 return XSTR_LITERAL;
@@ -224,12 +227,18 @@ int X86Lexer::getNextToken()
             case '\'': {
                 tkText.clear();
                 ch = nextChar();
-                APPEND_SEQUENCE(ch != '\'', tkText);
+                APPEND_SEQUENCE((ch != '\'') && (ch != EOF), tkText);
                 ch = nextChar();
                 
-                if (tkText.length() != 1) {
-                    reportError("Invalid character constant '%s'\n", tkText.c_str());
+                if (ch == EOF) {
+                    tokenInfo.set(string("unterminated character constant '") + tkText + string("'"), currentLine);
+                    return XTK_ERROR;
                 }
+                if (tkText.length() != 1) {
+                    tokenInfo.set("character constant '" + tkText + "'", currentLine);
+                    return XTK_ERROR;
+                }
+                
                 tokenInfo.set(tkText, currentLine);
                 tokenInfo.intValue = (int)tkText[0];
                 
@@ -255,8 +264,8 @@ int X86Lexer::getNextToken()
                         APPEND_SEQUENCE((ch=='0') || (ch=='1'), tkText);
 						
                         if (tkText.empty()) {
-                            reportError("Invalid binary constant detected at line %d\n", currentLine);
-
+                            tokenInfo.set("binary constant '0b'", currentLine);
+                            
                             return XTK_ERROR;
                         }
 
@@ -272,8 +281,8 @@ int X86Lexer::getNextToken()
                         APPEND_SEQUENCE(isxdigit(ch), tkText);
 
                         if (tkText.empty()) {
-                            reportError("Invalid hexadecimal constant detected at line %d\n", currentLine);
-
+                            tokenInfo.set("hexadecimal constant '0x'", currentLine);
+                            
                             return XTK_ERROR;
                         }
                         tokenInfo.set(tkText, currentLine);
@@ -305,7 +314,7 @@ int X86Lexer::getNextToken()
                     return lookUpWord(kw, KWCount, tkText);
 
                 } else {
-                    reportError("Invalid symbol '%X' detected at line %d\n", ch, currentLine);
+                    tokenInfo.set(string("symbol '") + ((char)ch) + string("'"), currentLine);
                     return XTK_ERROR;
                 }
             }
@@ -320,6 +329,7 @@ string X86Lexer::getTokenString(int token, TokenInfo *info)
     switch (token) {
     case XTK_EOF: tokenName = "end of input"; break;
     case XTK_EOL: tokenName = "end of line"; break;
+    case XTK_ERROR: tokenName = ""; break;
 
     case XCKW_EXEC:
     case XCKW_SET:
@@ -417,8 +427,18 @@ string X86Lexer::getTokenString(int token, TokenInfo *info)
 
     string result = tokenName;
 
-    if (info != NULL)
-        result += " '" + info->tokenLexeme + "'";
+    if (info != NULL) {
+        switch (token) {
+            case XTK_ERROR:
+                result += info->tokenLexeme;
+                break;
+            case XTK_EOL:
+            case XTK_EOF:
+                break;
+            default:
+                result += " '" + info->tokenLexeme + "'";
+        }
+    }
 
     return result;
 }
